@@ -1,0 +1,234 @@
+import { assertDomainName, toAscii } from '../../shared/domain-name';
+import type { RegistrarName } from '@aoxborrow/registrar-client';
+import { getBaseRenewal } from './base-pricing';
+import { Namespace } from '../storage/namespace';
+import { isUniformTld } from '../../shared/tlds';
+import type { RenewalPriceInput, RenewalPricing } from '../../shared/ipc';
+import { toCurrencyCode } from '../../shared/currencies';
+import { parseCanonicalAmount } from '../../shared/money';
+import { toRenewalPrice, type RenewalPrice } from '../../shared/renewal-prices';
+import { RENEWAL_PRICES_NAMESPACE } from '../storage/names';
+
+// Renewal-price resolver backing the Renewals dashboard and the Domains renewal
+// column. Prices come from four layers, most-accurate first:
+//
+//   1. manual override — a price the user typed in (kept in domain-prices).
+//   2. per-name API quote — only for registrars that price a *specific* domain,
+//      so the figure captures premium renewals. Gandi (its per-name price
+//      endpoint), Dynadot (its classic renew price-check quote), GoDaddy
+//      premium names (v3 availability renewalPrice), and Namecheap premium
+//      names (domains.check PremiumRenewalPrice) qualify. The rest either
+//      can't price an owned domain at all (Cloudflare/Spaceship/NameBright)
+//      or only expose a generic per-TLD rate (Namecheap's standard names
+//      take layer 3).
+//      (Porkbun *can* price per-name via checkDomain, but its aggressive
+//      rate limit made that impractical, so it takes the base rate too.) This
+//      quote is fetched as part of the domain Sync and stored with the
+//      domain's detail — see registrars.ts; it isn't fetched here.
+//   3. TLD rate — the account's own price for a TLD (kept in tld-rates).
+//      GoDaddy Sync fills this from one v3 availability quote per TLD, which
+//      is priced for the authenticated shopper, so it carries whatever
+//      discount the account holds (a Discount Domain Club membership, say)
+//      and the published list price otherwise. Namecheap Sync fills it from
+//      users.getPricing, one call per TLD, which is likewise the price for the
+//      authenticated user rather than the public list price. Applies to every
+//      name at that account/TLD that did not already resolve via (1) or (2).
+//   4. base database — the standard per-TLD rate that fills everything else
+//      (see base-pricing.ts). This is a local lookup, so the vast majority of
+//      domains resolve with no network call at all.
+//
+// Your manual price carries its own currency, and so does a per-name quote;
+// TLD rates and the base database are USD. This module is deliberately pure: it reads the
+// bundled base rates, TLD rates, and manual overrides and assembles a
+// RenewalPricing — it never touches the network or a registrar client (that
+// lives in the sync).
+
+// Registrars whose `getPricing(domain)` returns a genuine per-name renewal for a
+// domain you already own, premium included (verified live). Only these get an
+// API lookup, and only for TLDs that can actually carry premium names (see
+// NO_PREMIUM_TLDS). Porkbun qualifies technically, but its aggressive rate limit
+// made per-name lookups impractical, so it's intentionally left out and falls
+// back to the base rate.
+const SPECIFIC_CAPABLE = new Set<RegistrarName>(['gandi', 'dynadot']);
+
+// Name.com has no bundled base-rate table. Quote every owned domain, including
+// legacy extensions, once the released library adds this provider.
+const ALWAYS_QUOTE = new Set<string>(['namecom']);
+
+/**
+ * Whether a per-name API quote is worth fetching for this registrar + TLD: the
+ * registrar must price owned domains specifically, and the TLD must be able to
+ * carry premium names in the first place. Used by the sync to decide which
+ * domains get a live quote; every other domain resolves from the base database.
+ */
+export function usesPerNameQuote(
+  registrar: RegistrarName,
+  tld: string,
+): boolean {
+  return (
+    ALWAYS_QUOTE.has(registrar) ||
+    (SPECIFIC_CAPABLE.has(registrar) && !isUniformTld(tld))
+  );
+}
+
+/** A per-name renewal quote fetched during Sync and stored with the detail. */
+export interface RenewalQuote {
+  renewal: number | null;
+  currency: string;
+}
+
+// Manual per-domain renewal overrides, keyed by `toAscii(domain)` so an
+// override follows the name when it moves between accounts. Stored as a USD
+// number before schema 3 (see `toRenewalPrice`).
+const overrides = new Namespace<RenewalPrice>(RENEWAL_PRICES_NAMESPACE);
+
+/**
+ * A renewal price read from a data bundle, re-checked; null when it doesn't
+ * hold. A bundle before v7 stores a USD number, which becomes a USD amount.
+ */
+export function cleanRenewalPrice(
+  _key: string,
+  value: unknown,
+): RenewalPrice | null {
+  return toRenewalPrice(value);
+}
+
+// Shopper annual renewal (USD) per account + TLD, keyed `${accountId ?? registrar}:${tld}`.
+// Fetched during Sync, so "Clear cache" may drop it; the next Sync refills it.
+const tldRates = new Namespace<number>('registrar-tld-rates', { cache: true });
+
+/** Everything after the first dot, lowercased. "example.co.uk" → "co.uk". */
+export function tldOf(domain: string): string {
+  const dot = domain.indexOf('.');
+  return dot === -1 ? '' : domain.slice(dot + 1).toLowerCase();
+}
+
+/** Strip a leading dot and lowercase. ".COM" → "com". */
+export function normalizeTld(raw: string): string {
+  return raw.trim().replace(/^\.+/, '').toLowerCase();
+}
+
+/**
+ * Assemble a domain's renewal price with provenance from local data only:
+ * manual override wins; then the per-name quote captured at Sync (premium-
+ * accurate); then a shopper TLD rate; then the base per-TLD database; otherwise
+ * unavailable. Never hits the network — pass the stored `quote` when one was
+ * synced for this domain.
+ */
+export function resolvePricing(
+  registrar: RegistrarName,
+  domain: string,
+  quote?: RenewalQuote,
+  accountId?: string,
+): RenewalPricing {
+  const manual = toRenewalPrice(overrides.get(toAscii(domain)));
+  if (manual) {
+    return {
+      domain,
+      registrar,
+      renewal: Number(manual.amount),
+      currency: manual.currency,
+      source: 'manual',
+    };
+  }
+
+  if (quote && quote.renewal !== null) {
+    return {
+      domain,
+      registrar,
+      renewal: quote.renewal,
+      currency: quote.currency,
+      source: 'api',
+    };
+  }
+
+  const tld = tldOf(domain);
+  const custom =
+    tldRates.get(`${accountId ?? registrar}:${tld}`) ??
+    tldRates.get(`${registrar}:${tld}`);
+  if (typeof custom === 'number') {
+    return {
+      domain,
+      registrar,
+      renewal: custom,
+      currency: 'USD',
+      source: 'tld',
+    };
+  }
+
+  const base = getBaseRenewal(registrar, tld);
+  if (base !== null) {
+    return {
+      domain,
+      registrar,
+      renewal: base,
+      currency: 'USD',
+      source: 'base',
+    };
+  }
+
+  return {
+    domain,
+    registrar,
+    renewal: null,
+    currency: 'USD',
+    source: 'unavailable',
+  };
+}
+
+/** Sets or clears (null, or a zero amount) a manual annual renewal price for
+ *  a domain, in any currency, whichever account holds it. */
+export function setManualPrice(
+  domain: string,
+  price: RenewalPriceInput | null,
+): void {
+  const key = assertDomainName(domain);
+  if (price === null) {
+    void overrides.delete(key);
+    return;
+  }
+  const currency = toCurrencyCode(price.currency);
+  if (!currency) {
+    throw new Error(`Unknown currency ${price.currency.trim().toUpperCase()}.`);
+  }
+  const amount = parseCanonicalAmount(price.amount, currency, 'Renewal price');
+  if (amount === null || Number(amount) === 0) void overrides.delete(key);
+  else void overrides.set(key, { amount, currency });
+}
+
+/** Every manual renewal price, keyed by `toAscii(name)`. */
+export function getManualPrices(): Record<string, RenewalPrice> {
+  const out: Record<string, RenewalPrice> = {};
+  for (const [key, value] of Object.entries(overrides.all())) {
+    const price = toRenewalPrice(value);
+    if (price) out[key] = price;
+  }
+  return out;
+}
+
+/** Sets (number) or clears (null) a shopper annual renewal rate for a registrar + TLD. */
+export function setTldRate(
+  registrar: RegistrarName,
+  tld: string,
+  price: number | null,
+  accountId?: string,
+): void {
+  const key = `${accountId ?? registrar}:${normalizeTld(tld)}`;
+  if (price === null || Number.isNaN(price)) {
+    void tldRates.delete(key);
+  } else {
+    void tldRates.set(key, price);
+  }
+}
+
+/** Sets (or, with null, clears) many names' manual renewal prices (an import). */
+export function setManualPrices(
+  entries: [domain: string, RenewalPrice | null][],
+): void {
+  const set: [string, RenewalPrice][] = [];
+  for (const [domain, price] of entries) {
+    if (price) set.push([assertDomainName(domain), price]);
+    else void overrides.delete(assertDomainName(domain));
+  }
+  if (set.length > 0) void overrides.setMany(set);
+}

@@ -1,0 +1,56 @@
+// Bake the latest GitHub Release's download URLs + version into the landing page
+// at build time, so the shipped HTML is fully static (no client-side API calls).
+//
+// The releases live in the repo as site/public/releases.json, written and
+// committed by the release workflow right after it publishes (that commit is
+// also what redeploys the site). The site's Vite config passes the newest one
+// to bakeRelease() as `{ tagName, assets: [{ name, url }] }` from a
+// transformIndexHtml hook, so index.html on disk is never rewritten.
+//
+// Matches each download button (data-asset="…") to a release asset by filename
+// and rewrites its href; fills the version and reveals it. With no release
+// recorded it does nothing — the buttons keep their hard-coded /releases href.
+
+// data-asset key -> predicate over the asset filename.
+const MATCHERS = {
+  'dmg-arm64': (n) => /\.dmg$/i.test(n) && /arm64/i.test(n),
+  'dmg-x64': (n) => /\.dmg$/i.test(n) && /(x64|x86_64|intel)/i.test(n),
+  exe: (n) => /\.exe$/i.test(n),
+  deb: (n) => /\.deb$/i.test(n),
+  rpm: (n) => /\.rpm$/i.test(n),
+};
+
+/** Returns `html` with the release's links and version baked in. */
+export function bakeRelease(html, rel) {
+  const assets = rel?.assets || [];
+  if (!rel?.tagName || assets.length === 0) {
+    console.log(
+      'inject-release: no release recorded — leaving /releases fallback links.',
+    );
+    return html;
+  }
+  for (const [key, match] of Object.entries(MATCHERS)) {
+    const asset = assets.find((a) => match(a.name));
+    if (!asset) {
+      console.warn(`inject-release: no asset matched data-asset="${key}"`);
+      continue;
+    }
+    // Replace the href of the <a> tag carrying data-asset="<key>" (href precedes it).
+    const re = new RegExp(`(<a\\s+href=")[^"]*("[^>]*\\bdata-asset="${key}")`);
+    const next = html.replace(re, `$1${asset.url}$2`);
+    if (next === html)
+      console.warn(
+        `inject-release: could not find link for data-asset="${key}"`,
+      );
+    html = next;
+  }
+  // Fill + reveal the version.
+  html = html
+    .replace('data-dl-version-wrap hidden', 'data-dl-version-wrap')
+    .replace(
+      '<strong data-dl-version></strong>',
+      `<strong data-dl-version>${rel.tagName}</strong>`,
+    );
+  console.log(`inject-release: baked ${rel.tagName} (${assets.length} assets)`);
+  return html;
+}

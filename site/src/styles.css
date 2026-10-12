@@ -1,0 +1,357 @@
+:root {
+  /* light ink on near-black, with a single army-green accent */
+  --bg: #0d0d0f;
+  --surface: #161618;
+  --surface-2: #1e1e21;
+  --ink: #ededf0;
+  --muted: #a1a1aa;
+  --faint: #71717a;
+  --line: #27272a;
+  --line-strong: #3a3a40;
+  --accent: #31613b;
+  /* Lighter tint of the brand green for text/icons/logo on the near-black bg. */
+  --accent-ink: #7ac28d;
+  --accent-fill: #31613b;
+  --on-accent: #eef1e6;
+  --accent-wash: #0e1710;
+  --focus: 0 0 0 3px rgba(49,97,59,.45);
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  font-size: 15px;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+
+.wrap { width: 100%; max-width: 960px; margin: 0 auto; padding: 0 24px; }
+
+h1, h2, h3 { font-family: inherit; font-weight: 600; text-wrap: balance; letter-spacing: -.01em; margin: 0; color: var(--ink); }
+h1 { font-size: 1.85rem; line-height: 1.2; letter-spacing: -.02em; }
+h2 { font-size: 1.3rem; line-height: 1.25; }
+h3 { font-size: .95rem; line-height: 1.4; font-weight: 600; }
+p { margin: 0; }
+a { color: var(--accent-ink); text-underline-offset: 2px; text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent); }
+a:hover { text-decoration-color: var(--accent); }
+code, .mono { font-family: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace; }
+
+:where(a, button, input, [tabindex]):focus-visible { outline: none; box-shadow: var(--focus); border-radius: 6px; }
+
+.eyebrow {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: .7rem; font-weight: 500; letter-spacing: .12em; text-transform: uppercase;
+  color: var(--accent-ink);
+}
+
+/* ── nav ── */
+.nav { position: sticky; top: 0; z-index: 50; background: color-mix(in srgb, var(--bg) 86%, transparent); backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); }
+.nav-in { display: flex; align-items: center; gap: 20px; height: 54px; }
+.brand { display: inline-flex; align-items: center; gap: 7px; font-family: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif; font-weight: 700; font-size: 1.28rem; color: var(--ink); text-decoration: none; letter-spacing: -.01em; }
+.brand svg { width: 28px; height: 28px; display: block; }
+.brand-dom { color: var(--ink); }
+.brand-bot { color: var(--accent-ink); }
+.nav-links { margin-left: auto; display: flex; align-items: center; gap: 20px; }
+.nav-links a { color: var(--muted); text-decoration: none; font-size: .85rem; }
+.nav-links a:hover { color: var(--ink); }
+/* GitHub mark: icon only on desktop, the label is for the phone menu. */
+.nav-gh { display: inline-flex; align-items: center; gap: 8px; }
+.nav-gh svg { width: 20px; height: 20px; display: block; }
+.nav-gh span { display: none; }
+/* Header CTAs: the site buttons, one size down, tightened together. */
+.nav-links .nav-cta { font-size: .82rem; line-height: 16px; padding: 6.5px 12px 7.5px; color: var(--ink); }
+/* Download in the header is a green outline, so the filled hero button stays the loudest thing on the page. */
+@media (min-width: 640px) {
+  .nav-links .nav-cta.btn-primary { background: transparent; color: var(--accent-ink); border-color: color-mix(in srgb, var(--accent-ink) 55%, transparent); }
+  .nav-links .nav-cta.btn-primary:hover { background: var(--accent-wash); border-color: var(--accent-ink); }
+}
+.nav-links .nav-cta + .nav-cta { margin-left: -10px; }
+/* Hamburger toggle — hidden on desktop, shown on phones. */
+.nav-toggle { display: none; margin-left: auto; align-items: center; justify-content: center; width: 38px; height: 38px; padding: 0; background: none; border: 1px solid var(--line-strong); border-radius: 8px; color: var(--ink); cursor: pointer; }
+.nav-toggle svg { width: 20px; height: 20px; display: block; }
+.nav-toggle .ic-close { display: none; }
+/* Phones: collapse the links into a dropdown behind the hamburger. */
+@media (max-width: 639px) {
+  .nav-toggle { display: inline-flex; }
+  .nav.open .nav-toggle .ic-menu { display: none; }
+  .nav.open .nav-toggle .ic-close { display: block; }
+  .nav-links {
+    display: none; margin: 0; gap: 0;
+    position: absolute; top: 100%; left: 0; right: 0;
+    flex-direction: column; align-items: stretch;
+    background: var(--bg); border-bottom: 1px solid var(--line);
+    box-shadow: 0 10px 24px rgba(0, 0, 0, .45);
+  }
+  .nav.open .nav-links { display: flex; }
+  .nav-links a { padding: 12px 24px; font-size: .95rem; }
+  .nav-links a:hover { color: var(--ink); background: color-mix(in srgb, var(--ink) 7%, transparent); }
+  /* In the dropdown the GitHub mark and CTAs become plain rows like the rest. */
+  .nav-gh span { display: inline; }
+  .nav-gh svg { width: 18px; height: 18px; }
+  .nav-links .nav-cta, .nav-links .nav-cta.btn-primary {
+    font-size: .95rem; font-weight: 400; padding: 12px 24px; margin: 0;
+    border: 0; border-radius: 0; background: none; color: var(--muted);
+  }
+  .nav-links .nav-cta:hover { color: var(--ink); background: color-mix(in srgb, var(--ink) 7%, transparent); }
+}
+
+/* ── buttons ── */
+.btn { display: inline-flex; align-items: center; gap: 8px; font-family: inherit; font-size: .88rem; font-weight: 500; padding: 8px 16px; border-radius: 7px; border: 1px solid var(--line-strong); cursor: pointer; text-decoration: none; background: var(--bg); color: var(--ink); transition: border-color .15s ease, background .15s ease; white-space: nowrap; }
+.btn:hover { border-color: var(--ink); }
+.btn-primary { background: var(--accent-fill); color: var(--on-accent); border-color: var(--accent-fill); font-weight: 600; }
+.btn-primary:hover { background: color-mix(in srgb, var(--accent-fill) 88%, #000); border-color: color-mix(in srgb, var(--accent-fill) 88%, #000); }
+.btn svg { width: 16px; height: 16px; }
+
+/* ── hero ── */
+.hero { padding: 64px 0 48px; }
+.hero-grid { display: grid; gap: 40px; align-items: center; }
+@media (min-width: 880px) { .hero-grid { grid-template-columns: 1fr 1fr; gap: 48px; } .hero { padding: 80px 0 56px; } }
+.hero h1 { margin: 14px 0 0; }
+.hero .lede { margin-top: 16px; font-size: 1rem; color: var(--muted); max-width: 42ch; }
+.hero .lede strong { color: var(--ink); font-weight: 500; }
+.hero .lede .nowrap { white-space: nowrap; }
+.hero-cta { margin-top: 26px; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.hero-note { margin-top: 16px; font-size: .78rem; color: var(--faint); font-family: "IBM Plex Mono", monospace; letter-spacing: .01em; }
+
+/* ── app screenshot ── */
+/* Dark UI on a dark page: an accent backlight lifts it off the background, a
+   thin title bar reads as window chrome, and a deep soft shadow gives it
+   elevation. The glow sits on .window (unclipped); the bar + shot carry the
+   border and clip their own corners. */
+.window {
+  width: 100%;
+  position: relative; border-radius: 12px; isolation: isolate;
+  box-shadow: 0 1px 2px rgba(0,0,0,.4), 0 22px 48px -14px rgba(0,0,0,.75);
+}
+/* The halo below bleeds 32% past the frame; clip it at the viewport edge so it
+   can't widen the document into a horizontal scroll. -x only, so the vertical
+   bleed (into the nav and the next section) is untouched. */
+.hero { overflow-x: clip; }
+.window::before { /* ambient accent backlight — a halo bleeding out around the frame */
+  content: ""; position: absolute; inset: -32%; z-index: -1; pointer-events: none;
+  background: radial-gradient(50% 50% at 50% 45%, color-mix(in srgb, var(--accent-ink) 92%, transparent), transparent 72%);
+  filter: blur(64px); opacity: .52;
+}
+.window-bar {
+  display: flex; align-items: center; gap: 6px; height: 20px; padding: 0 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--line-strong); border-bottom: none;
+  border-radius: 12px 12px 0 0;
+}
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--line-strong); }
+.shot {
+  /* 1801/1445 is the image ratio (the capture is pre-cropped to the top-left
+     of the Domains screen, ending on a row boundary). Declared so the frame
+     holds its height before the image loads. */
+  position: relative; aspect-ratio: 1801 / 1445; overflow: hidden;
+  border: 1px solid var(--line-strong); border-top: none;
+  border-radius: 0 0 12px 12px; background: var(--surface);
+}
+/* The whole capture, no scaling or cropping. */
+.shot img { display: block; width: 100%; height: auto; }
+.shot-label { display: inline-flex; align-items: center; gap: 8px; font-family: "IBM Plex Mono", monospace; font-size: .74rem; color: var(--muted); background: var(--bg); border: 1px dashed var(--line-strong); padding: 7px 12px; border-radius: 999px; }
+
+/* ── generic section ── */
+section { padding: 56px 0; border-top: 1px solid var(--line); }
+.sec-head { max-width: 600px; }
+.sec-head h2 { margin-top: 10px; }
+.sec-head p { margin-top: 10px; color: var(--muted); font-size: .95rem; }
+/* Logo-cloud variant: a single centered title, no eyebrow or lede. */
+.sec-head-center { max-width: none; text-align: center; }
+.sec-head-center h2 { margin-top: 0; }
+
+/* ── features: a single-column list beside the Renewals screenshot ── */
+/* Stacked on narrow screens (list first, then the screenshot); side by side
+   from 880px with the screenshot on the left, mirroring the hero. */
+.features-grid { margin-top: 30px; display: grid; gap: 36px; align-items: center; }
+@media (min-width: 880px) { .features-grid { grid-template-columns: 1fr 1fr; gap: 48px; } .features-grid .window-features { order: -1; } }
+.features-grid > * { min-width: 0; }
+.features { display: grid; grid-template-columns: 1fr; gap: 20px; }
+.feature { display: flex; align-items: flex-start; gap: 12px; }
+.feature .ic { flex-shrink: 0; width: 28px; height: 28px; border-radius: 7px; display: grid; place-items: center; background: var(--accent-wash); border: 1px solid color-mix(in srgb, var(--accent) 20%, var(--line)); color: var(--accent-ink); }
+.feature .ic svg { width: 16px; height: 16px; }
+.feature .txt { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.feature h3 { margin: 1px 0 0; }
+.feature p { color: var(--muted); font-size: .85rem; line-height: 1.5; }
+/* Same framed-window treatment as the hero. The halo would otherwise bleed
+   past the viewport edge. */
+#features { overflow-x: clip; }
+/* The frame shows the left two-thirds of the full 2804×1778 Renewals capture
+   (heading, the first two stat cards, most of the month chart) and trims the
+   status bar off the bottom, so the frame is taller than the wide capture
+   would be. The image itself isn't cropped: it's scaled to 150% of the frame
+   and the frame's overflow clips the rest. */
+.shot-renewals { aspect-ratio: 1869.33 / 1700; /* (2804 ÷ 1.5) / (1778 − 78) */ }
+.shot-renewals img { width: 150%; max-width: none; }
+
+/* ── download ── */
+.dl-grid { margin-top: 34px; display: grid; gap: 14px; }
+@media (min-width: 760px) { .dl-grid { grid-template-columns: repeat(3, 1fr); } }
+.dl-card { position: relative; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--surface); padding: 20px; display: flex; flex-direction: column; gap: 5px; }
+.dl-card.detected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.dl-card .os { display: flex; align-items: center; gap: 9px; font-weight: 600; font-size: .98rem; }
+.dl-card .os svg { width: 20px; height: 20px; }
+.dl-card .meta { font-size: .78rem; color: var(--faint); font-family: "IBM Plex Mono", monospace; }
+.dl-card .assets { margin-top: 12px; display: flex; flex-direction: column; gap: 7px; }
+.dl-card .assets a { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-radius: 7px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); text-decoration: none; font-size: .84rem; }
+.dl-card .assets a:hover { border-color: var(--accent); }
+.dl-card .assets a:hover .dl-ico { color: var(--accent-ink); }
+.dl-card .assets .fmt { margin-left: auto; font-family: "IBM Plex Mono", monospace; font-size: .74rem; color: var(--faint); }
+.dl-card .assets .dl-ico { flex-shrink: 0; width: 15px; height: 15px; color: var(--faint); }
+.detected-chip { position: absolute; top: -10px; right: 14px; font-family: "IBM Plex Mono", monospace; font-size: .64rem; letter-spacing: .08em; text-transform: uppercase; color: var(--on-accent); background: var(--accent-fill); padding: 3px 9px; border-radius: 999px; display: none; }
+.dl-card.detected .detected-chip { display: inline-block; }
+
+/* ── per-card unsigned note ── */
+.dl-note { margin-top: auto; padding-top: 4px; font-size: .76rem; line-height: 1.5; color: var(--faint); }
+.dl-note b { color: var(--muted); font-weight: 500; }
+.dl-note code { font-family: "IBM Plex Mono", monospace; font-size: .7rem; color: var(--muted); background: var(--surface-2); border: 1px solid var(--line); padding: 1px 5px; border-radius: 4px; word-break: break-all; }
+
+pre { margin: 10px 0 0; background: var(--surface-2); color: var(--ink); border: 1px solid var(--line-strong); border-radius: 8px; padding: 12px 14px; overflow-x: auto; font-family: "IBM Plex Mono", monospace; font-size: .8rem; line-height: 1.55; }
+pre .c { color: var(--faint); }
+pre .a { color: var(--accent-ink); font-weight: 500; }
+
+/* ── faq ── */
+.faq { margin-top: 30px; display: grid; gap: 24px; max-width: 600px; /* same measure as .sec-head */ }
+.faq-item h3 { font-size: .92rem; }
+.faq-item p { margin-top: 7px; color: var(--muted); font-size: .88rem; }
+.faq-item a { font-weight: 500; }
+
+/* ── registrar logo cloud: centered, wraps to natural widths ── */
+.logos { margin-top: 28px; display: flex; flex-wrap: wrap; justify-content: center; gap: 10px 36px; }
+/* Phones: a centered two-column grid so the ten entries pair up cleanly instead of
+   stranding odd items alone on a row. */
+@media (max-width: 519px) { .logos { display: grid; grid-template-columns: repeat(2, auto); justify-content: center; column-gap: 24px; } }
+.logo { display: flex; align-items: center; gap: 10px; padding: 8px 4px; }
+.logo-mark { flex-shrink: 0; width: 30px; height: 30px; border-radius: 8px; background: var(--bg); border: 1px solid var(--line); display: grid; place-items: center; font-family: "IBM Plex Mono", monospace; font-weight: 600; font-size: .85rem; color: var(--faint); }
+/* Real brand mark: flat light-grey at rest (grayscale() would let dark logos vanish
+   on the near-black ground), true brand color on hover. Needs transparent SVGs. */
+.logo-img { flex-shrink: 0; width: 28px; height: 28px; object-fit: contain; filter: brightness(0) invert(.6); opacity: .9; transition: filter .15s ease, opacity .15s ease; }
+.logo:hover .logo-img { filter: none; opacity: 1; }
+.logo:hover .logo-name { color: var(--ink); }
+.logo-name { font-weight: 500; font-size: 1.05rem; color: var(--muted); transition: color .15s ease; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Phones: tighter marks and type so the two-column cloud stays compact. */
+@media (max-width: 519px) {
+  .logo { gap: 9px; padding: 6px 4px; }
+  .logo-img, .logo-mark { width: 24px; height: 24px; }
+  .logo-name { font-size: .95rem; }
+}
+.logos-foot { margin-top: 20px; display: flex; align-items: center; justify-content: center; gap: 7px; font-size: .86rem; color: var(--accent-ink); }
+.logos-foot-plus { flex-shrink: 0; width: 15px; height: 15px; }
+.logos-foot b { color: var(--ink); font-weight: 500; }
+
+/* ── mcp ── */
+/* ── MCP: copy + connect snippets on the left, a mock conversation on the right ── */
+.mcp-grid { display: grid; gap: 28px; align-items: center; }
+@media (min-width: 880px) { .mcp-grid { grid-template-columns: 1fr 1fr; gap: 48px; } .mcp-connect { margin-top: 30px; } }
+/* Stacked: dissolve the left wrapper so the chat can sit between the intro and the connect snippets. */
+@media (max-width: 879px) { .mcp-left { display: contents; } .chat { order: 1; } .mcp-connect { order: 2; } .mcp-connect .mcp-install:first-child { margin-top: 0; } }
+/* min-width: 0 stops the no-wrap connect snippet from widening the left track past 1fr. */
+.mcp-grid > * { min-width: 0; }
+.mcp-grid .sec-head p { line-height: 1.6; }
+/* In the half-width column the connect command doesn't fit on one line — wrap it rather than scroll. */
+.mcp-grid .mcp-install pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.chat {
+  border: 1px solid var(--line-strong); border-radius: 12px; overflow: hidden; background: var(--surface);
+  box-shadow: 0 1px 2px rgba(0,0,0,.4), 0 22px 48px -14px rgba(0,0,0,.75);
+}
+.chat .window-bar { border: none; border-bottom: 1px solid var(--line); border-radius: 0; }
+.chat-body { padding: 18px; display: flex; flex-direction: column; gap: 10px; font-size: .86rem; line-height: 1.5; }
+.msg { max-width: 86%; padding: 9px 13px; border-radius: 14px; }
+.msg.user { align-self: flex-end; color: #fff; background: var(--accent-fill); border: 1px solid color-mix(in srgb, var(--accent-ink) 45%, var(--accent-fill)); border-bottom-right-radius: 4px; }
+.msg.bot { align-self: flex-start; color: var(--muted); background: #2a2a2e; border: 1px solid var(--line-strong); border-bottom-left-radius: 4px; }
+.msg.bot b { color: var(--ink); font-weight: 500; }
+
+.mcp-install { margin-top: 30px; }
+.mcp-install + .mcp-install { margin-top: 18px; }
+.mcp-install-label { color: var(--faint); font-family: "IBM Plex Mono", monospace; font-size: .68rem; letter-spacing: .1em; text-transform: uppercase; margin-bottom: 8px; }
+.mcp-install pre { margin: 0; padding-right: 46px; }
+.snippet-plain pre { padding-right: 14px; } /* no copy button to make room for */
+.snippet { position: relative; display: inline-block; max-width: 100%; vertical-align: top; }
+.copy-btn { position: absolute; top: 7px; right: 7px; width: 30px; height: 30px; display: grid; place-items: center; padding: 0; border-radius: 6px; border: 1px solid var(--line-strong); background: var(--surface); color: var(--muted); cursor: pointer; transition: color .15s ease, border-color .15s ease, background .15s ease; }
+.copy-btn:hover { color: var(--ink); border-color: var(--line-strong); background: var(--surface-2); }
+.copy-btn:focus-visible { outline: none; box-shadow: var(--focus); }
+.copy-btn svg { width: 15px; height: 15px; display: block; }
+.copy-btn .ic-check { display: none; }
+.copy-btn.copied { color: var(--accent-ink); border-color: color-mix(in srgb, var(--accent) 45%, var(--line-strong)); }
+.copy-btn.copied .ic-copy { display: none; }
+.copy-btn.copied .ic-check { display: block; }
+.mcp-features-head { margin-top: 34px; margin-bottom: 14px; }
+.mcp-list { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: 1fr; gap: 10px 20px; }
+@media (min-width: 480px) { .mcp-list { grid-template-columns: 1fr 1fr; } }
+.mcp-list li { position: relative; padding-left: 22px; font-size: .88rem; color: var(--ink); }
+.mcp-list li::before { content: ""; position: absolute; left: 3px; top: .58em; width: 5px; height: 5px; border-radius: 50%; background: var(--accent-ink); }
+
+/* ── footer ── */
+footer { border-top: 1px solid var(--line); padding: 48px 0 40px; }
+/* Phones: brand block on top, link columns two-up. Desktop: one row of four. */
+.foot-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 32px 24px; }
+.foot-brand { grid-column: 1 / -1; }
+.foot-tag { margin-top: 12px; max-width: 30ch; font-size: .85rem; line-height: 1.55; color: var(--muted); }
+.foot-social { display: flex; gap: 6px; margin: 14px 0 0 -8px; }
+.foot-social a { display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; border-radius: 8px; color: var(--muted); }
+.foot-social a:hover { color: var(--ink); background: color-mix(in srgb, var(--ink) 7%, transparent); }
+.foot-social svg { width: 18px; height: 18px; display: block; }
+.foot-col { display: flex; flex-direction: column; align-items: flex-start; }
+.foot-col h3 { margin-bottom: 8px; font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: .7rem; font-weight: 500; letter-spacing: .12em; text-transform: uppercase; color: var(--faint); }
+.foot-col a { padding: 5px 0; color: var(--muted); text-decoration: none; font-size: .88rem; }
+.foot-col a:hover { color: var(--ink); }
+.foot-bar { display: flex; flex-wrap: wrap; gap: 6px 20px; justify-content: space-between; margin-top: 40px; padding-top: 20px; border-top: 1px solid var(--line); font-size: .78rem; color: var(--faint); font-family: "IBM Plex Mono", monospace; }
+@media (min-width: 640px) {
+  .foot-grid { grid-template-columns: 1.5fr repeat(3, 1fr); gap: 32px; }
+  .foot-brand { grid-column: auto; }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   PR ADDITIONS — redesign variants + "Two front ends, one core".
+   If you drop a VARIANT B section during the merge, you can delete
+   its rules here too (.hero-b for hero B; .duo* for #two-ways).
+   ═══════════════════════════════════════════════════════════════ */
+
+/* ── hero — VARIANT B (centered) ── */
+.hero-b { border-top: 1px solid var(--line); padding: 88px 0 64px; }
+.hero-center { display: flex; flex-direction: column; align-items: center; text-align: center; }
+.hero-b h1 { margin: 16px 0 0; font-size: 2.1rem; max-width: 22ch; }
+.hero-b .lede { max-width: 56ch; text-wrap: pretty; }
+.hero-b .hero-cta { margin-top: 28px; justify-content: center; }
+.hero-b .hero-note { margin-top: 18px; }
+
+/* ── two front ends, one core (#two-ways) ── */
+.duo { margin-top: 32px; display: grid; grid-template-columns: 1fr; gap: 16px; }
+@media (min-width: 880px) { .duo { grid-template-columns: 1fr 1fr; } }
+.duo-card { border: 1px solid var(--line-strong); border-radius: 10px; background: var(--surface); display: flex; flex-direction: column; overflow: hidden; }
+.duo-head { padding: 18px 20px 14px; display: flex; flex-direction: column; gap: 4px; }
+.duo-head .eyebrow { font-size: .66rem; }
+.duo-head p { color: var(--muted); font-size: .85rem; line-height: 1.5; }
+.duo-card .window { margin: 0 20px 20px; border-radius: 8px; border-color: var(--line); background: var(--bg); }
+.duo-card .window-bar { padding: 8px 10px; }
+.duo-card .dot { width: 8px; height: 8px; }
+.duo-card pre { margin: 0 20px; }
+.duo-card .mcp-list { margin: 16px 20px 20px; gap: 8px 16px; }
+.duo-card .mcp-list li { font-size: .85rem; }
+.duo-card .mcp-list li::before { top: .4em; width: 11px; height: 6px; }
+.duo-list { margin: 0 20px 20px; display: flex; flex-direction: column; }
+.duo-foot { margin: auto 20px 20px; padding-top: 14px; border-top: 1px solid var(--line); font-size: .78rem; color: var(--faint); line-height: 1.5; }
+.duo-foot b { color: var(--muted); font-weight: 500; }
+.mini-table { font-family: "IBM Plex Mono", monospace; font-size: .72rem; line-height: 1.4; }
+.mini-row { display: grid; grid-template-columns: 1.6fr 1fr .9fr .6fr; gap: 8px; padding: 7px 12px; border-bottom: 1px solid var(--line); color: var(--ink); }
+.mini-row:last-child { border-bottom: none; }
+.mini-row span:not(:first-child) { color: var(--muted); }
+.mini-row .soon { color: var(--accent-ink); }
+.mini-head { color: var(--faint); text-transform: uppercase; letter-spacing: .06em; font-size: .62rem; }
+
+/* ── Self-host ────────────────────────────────────────────────────────── */
+#selfhost .sec-head code { font-family: "IBM Plex Mono", monospace; font-size: .9em; background: var(--surface-2); border: 1px solid var(--line-strong); border-radius: 6px; padding: 1px 6px; }
+.steps { list-style: none; counter-reset: step; margin: 28px 0 0; padding: 0; display: grid; gap: 14px; max-width: 720px; }
+.steps li { counter-increment: step; position: relative; padding: 16px 18px 16px 58px; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; color: var(--muted); font-size: .95rem; line-height: 1.55; }
+.steps li b, .steps li em { color: var(--ink); }
+.steps li em { font-style: normal; font-weight: 500; }
+.steps li::before { content: counter(step); position: absolute; left: 18px; top: 16px; width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center; background: var(--accent); color: var(--accent-contrast, #fff); font-weight: 600; font-size: .85rem; }
+.step-action { margin-top: 12px; }
+.step-sub { display: block; margin-top: 3px; font-size: .85rem; color: var(--faint); }
+.self-host-note { margin-top: 18px; color: var(--muted); font-size: .9rem; max-width: 720px; }

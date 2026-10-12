@@ -1,0 +1,950 @@
+import { domainKey } from '../../shared/account-key';
+import { toAscii } from '../../shared/domain-name';
+import { create } from 'zustand';
+import type {
+  ImportedDomain,
+  ImportedDomainFields,
+  ListPrice,
+  ListPriceInput,
+  AppInfo,
+  AppSettings,
+  BulkJob,
+  BulkProgress,
+  Domain,
+  DomainOp,
+  DomainOpResult,
+  DomainPurchase,
+  DomainTarget,
+  DomainEvent,
+  OwnershipItem,
+  PurchaseInput,
+  RegistrationLookup,
+  SaleInput,
+  Folder,
+  FolderInput,
+  FolderPatch,
+  McpInfo,
+  PortfolioErrorInfo,
+  RegistrarMeta,
+  RegistrarName,
+  RegistrarSync,
+  RenewalPriceInput,
+  RenewalPricing,
+} from '../../shared/ipc';
+
+/** Hard ceiling on any sync — if the main-process fetch hangs (a registrar API
+ * that never responds), reject so the "Syncing…" state can't stick forever. */
+const SYNC_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+function withSyncTimeout<T>(p: Promise<T>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error('Sync timed out after 5 minutes')),
+      SYNC_TIMEOUT_MS,
+    );
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
+}
+
+// Tracks detail fetches in flight so concurrent enrich calls don't duplicate
+// work, and ones that failed / have no detail so we don't retry them on every
+// page revisit. Kept outside the store so they don't trigger re-renders.
+const enrichInFlight = new Set<string>();
+const enrichFailed = new Set<string>();
+
+// Guard so the eager whole-portfolio detail load doesn't overlap itself (which
+// would toggle its loading flag off while a pass is still running).
+let detailAllInFlight = false;
+
+interface AppState {
+  appInfo: AppInfo | null;
+  mcpInfo: McpInfo | null;
+  loadAppInfo: () => Promise<void>;
+  loadMcpInfo: () => Promise<void>;
+
+  // Aggregated portfolio across every configured registrar.
+  portfolio: Domain[];
+  portfolioErrors: PortfolioErrorInfo[];
+  portfolioRegistrars: string[];
+  /** Map of registrar id → nicely capitalized display name. */
+  portfolioRegistrarLabels: Record<string, string>;
+  portfolioLoading: boolean;
+  portfolioError: string | null;
+  /** When the portfolio data was last fetched from the registrars (ms epoch),
+   * or null. Comes from the cache on launch, or Date.now() on a live refresh. */
+  portfolioLoadedAt: number | null;
+  /** How the current portfolio arrived: restored from cache on launch, or a
+   * live fetch. Gates work that should only follow an explicit refresh (e.g.
+   * the Renewals page auto-fetching per-name prices). */
+  portfolioSource: 'cache' | 'live' | null;
+  /** Bumped on every live refresh so views can force-refresh their lazy data. */
+  refreshTick: number;
+  /** Live registrar metadata (configured flag + per-registrar sync state), from
+   * `getRegistrarMetadata`. `null` until first loaded. Shared source of truth so
+   * the Settings cards, status bar, and Domains empty state never disagree —
+   * cached portfolio counts must not show when nothing is configured, and
+   * configuring/syncing a registrar updates every surface immediately. */
+  registrars: RegistrarMeta[] | null;
+  /** Refresh `registrars` metadata from the main process. */
+  loadRegistrars: () => Promise<void>;
+  /** Sync one registrar's domains (e.g. after saving its credentials), merge the
+   * result into the portfolio, refresh `registrars`, and return its sync state. */
+  syncRegistrar: (
+    name: RegistrarName,
+    accountId?: string,
+  ) => Promise<RegistrarSync>;
+  /** Enable/disable an account (keeps credentials and cached data). Disabling hides its
+   * domains and stops syncs; enabling re-syncs it. Updates the portfolio,
+   * pricing, and registrar metadata to match. */
+  setRegistrarEnabled: (
+    name: RegistrarName,
+    enabled: boolean,
+    accountId?: string,
+  ) => Promise<void>;
+  /** Restore portfolio + detail + pricing from the on-disk cache
+   * with no network calls. Call once on app launch. */
+  hydrateFromCache: () => Promise<void>;
+  /** Re-read the portfolio + detail cache after an out-of-band write (an MCP
+   * tool) and overlay the changes onto the current view, so an open Domains
+   * table reflects them without a manual Sync. Unlike hydrateFromCache, this
+   * runs regardless of `portfolioSource` and never blanks a live portfolio. */
+  applyPortfolioCacheUpdate: () => Promise<void>;
+  /** Drop every on-disk cache and reset the in-memory portfolio to empty, so
+   * the app returns to its unloaded state and the next Load re-fetches fresh. */
+  clearAllCaches: () => Promise<void>;
+  loadPortfolio: () => Promise<void>;
+
+  // Lazy per-domain detail (nameservers/privacy/lock), keyed by `${registrar}:${domainName}`.
+  // Some registrars' list endpoints omit these; we fetch full detail only for
+  // on-screen rows that the list left without nameservers. See `enrichVisible`.
+  enriched: Record<string, Domain>;
+  /** Domains whose detail fetch is currently in flight (for per-cell loading). */
+  enriching: Record<string, boolean>;
+  /** Fetch detail for on-screen rows. `force` re-fetches even cached rows and
+   * bypasses the registrar/registry cache in main (used after a live refresh). */
+  enrichVisible: (domains: Domain[], force?: boolean) => Promise<void>;
+  /** True while a whole-portfolio detail (nameserver) load runs, so the
+   * Nameservers filter can show that its groups aren't complete yet. */
+  detailAllLoading: boolean;
+  /** Enrich every domain still missing detail — the eager whole-portfolio load
+   * that backs the Nameservers filter. */
+  loadAllDetail: (domains: Domain[]) => Promise<void>;
+
+  // Per-domain writes currently in flight, keyed `${registrar}:${domainName}`,
+  // so a toggled cell can disable itself until the round trip settles.
+  mutating: Record<string, boolean>;
+  /**
+   * Apply one domain operation at its registrar (see shared/ipc `DomainOp`).
+   * With `optimistic`, the merged row reflects those fields immediately and
+   * reverts if the outcome isn't `ok`; without it the row only updates from the
+   * result's patch. The row is marked `mutating` for the round trip. Never
+   * throws — a transport failure comes back as a `failed` result too, so
+   * callers render one shape.
+   */
+  applyDomainOp: (
+    target: DomainTarget,
+    op: DomainOp,
+    optimistic?: Partial<Domain>,
+  ) => Promise<DomainOpResult>;
+
+  // Annual renewal pricing, keyed by `${registrar}:${domainName}`. Backs the
+  // Renewals dashboard and the Domains renewal column. Computed in main from
+  // local data (base rates + TLD rates + Sync-captured quotes + manual
+  // overrides); it arrives with the launch snapshot and is refreshed after
+  // each Sync — there's no separate pricing fetch or refresh.
+  pricing: Record<string, RenewalPricing>;
+  /** Re-read the whole-portfolio pricing map from main (local, no network). */
+  loadPricing: () => Promise<void>;
+  setManualPrice: (
+    domain: string,
+    price: RenewalPriceInput | null,
+  ) => Promise<void>;
+
+  // User-defined folders for organizing domains, plus the domain→folder map
+  // (keyed `${registrar}:${domainName}`, the same key as `pricing`/`enriched`).
+  // Folders are user data, not cache — `clearAllCaches` leaves them untouched.
+  folders: Folder[];
+  folderAssignments: Record<string, string>;
+  /** Load folder definitions + assignments from disk. Called once on launch. */
+  loadFolders: () => Promise<void>;
+  createFolder: (input: FolderInput) => Promise<Folder>;
+  updateFolder: (id: string, patch: FolderPatch) => Promise<void>;
+  /** Delete a folder; also drops any local assignments pointing at it. */
+  deleteFolder: (id: string) => Promise<void>;
+  /** Assign a domain to a folder, or unassign it with a null folderId. */
+  assignFolder: (domainName: string, folderId: string | null) => Promise<void>;
+
+  // User-adjustable app settings (e.g. the background-sync interval). `null`
+  // until first loaded.
+  settings: AppSettings | null;
+  /** Load app settings from disk. Called once on launch. */
+  loadSettings: () => Promise<void>;
+  /** Set the background auto-sync interval in minutes (0 = off); applied live in
+   * main. */
+  setAutoSyncInterval: (minutes: number) => Promise<void>;
+  /** Push a just-saved nameserver set to the front of the recent presets. */
+  rememberNameservers: (nameservers: string[]) => Promise<void>;
+  /** Turn the embedded MCP server on or off; applied live in main. */
+  setMcpEnabled: (enabled: boolean) => Promise<void>;
+  /** Turn the daily check for a newer release on or off. */
+  setUpdateChecks: (enabled: boolean) => Promise<void>;
+  /** Save the preferred currency and the on-screen number format. */
+  saveMoneySettings: (
+    patch: Pick<AppSettings, 'preferredCurrency' | 'numberFormat'>,
+  ) => Promise<void>;
+
+  /** Purchase records keyed by normalized domain name. */
+  purchases: Record<string, DomainPurchase>;
+  loadPurchases: () => Promise<void>;
+  savePurchase: (input: PurchaseInput) => Promise<void>;
+  saveSale: (input: SaleInput) => Promise<void>;
+  saveNotes: (domainName: string, notes: string) => Promise<void>;
+
+  /**
+   * Names you own that no connected account reports, keyed by normalized
+   * domain name. Reloaded with the event log, since a sync can take one over.
+   */
+  importedDomains: Record<string, ImportedDomain>;
+  loadImportedDomains: () => Promise<void>;
+  saveImportedDomain: (
+    domainName: string,
+    fields: ImportedDomainFields,
+  ) => Promise<void>;
+
+  /** Asking prices keyed by normalized domain name. */
+  listPrices: Record<string, ListPrice>;
+  loadListPrices: () => Promise<void>;
+  /** Set or clear (all amounts blank) asking prices in one write. */
+  saveListPrices: (inputs: ListPriceInput[]) => Promise<void>;
+
+  /**
+   * Public registration for names on History, keyed by domain name; null for
+   * a name that couldn't be looked up.
+   */
+  registrationLookups: Record<string, RegistrationLookup | null>;
+  loadRegistrationLookups: (domainNames: string[]) => Promise<void>;
+
+  /**
+   * The domain event log: purchases, sales, and what sync saw. Ownership
+   * (Owned / Archive) and the alerts are derived from it (shared/ownership.ts,
+   * shared/sync-diff.ts).
+   */
+  domainEvents: DomainEvent[];
+  loadDomainEvents: () => Promise<void>;
+  /**
+   * Mark names Dropped or Archived on `date` (blank: today). Each `resolves`
+   * closes the alert it answers.
+   */
+  setDispositions: (
+    items: OwnershipItem[],
+    type: 'dropped' | 'archived',
+    date?: string | null,
+  ) => Promise<void>;
+  /** Mark names Sold with no price, dated `date` (blank: today). */
+  markSold: (items: OwnershipItem[], date?: string | null) => Promise<void>;
+  /** "Move back to Owned": undo Sold, Dropped, or Archived. */
+  restoreOwned: (domainNames: string[]) => Promise<void>;
+  setAlertsDismissed: (ids: string[], dismissed: boolean) => Promise<void>;
+  /** Undo one of your own events. */
+  deleteUserEvent: (id: string) => Promise<void>;
+  /** Delete everything DomBot holds about each name. */
+  deleteDomains: (domainNames: string[]) => Promise<void>;
+
+  // Row selection for bulk actions, keyed `${registrar}:${domainName}`. Lives
+  // here (not in the page) so it survives tab switches; pruned when the
+  // portfolio is replaced so vanished domains don't linger.
+  selected: Set<string>;
+  toggleSelected: (key: string) => void;
+  /** Add or remove many keys at once (the header checkbox). */
+  setSelectedMany: (keys: string[], on: boolean) => void;
+  clearSelection: () => void;
+
+  // The bulk job (main owns it; this mirrors it). One at a time.
+  bulk: BulkJob | null;
+  /** Start a job; rows in it read as `mutating` until their item lands. */
+  startBulk: (targets: DomainTarget[], op: DomainOp) => Promise<BulkJob>;
+  cancelBulk: () => Promise<void>;
+  /** Re-read the current/last job from main (launch, or after navigating). */
+  attachBulk: () => Promise<void>;
+  /** Event handlers wired once in App: overlay each item's patch on its row. */
+  applyBulkProgress: (p: BulkProgress) => void;
+  applyBulkFinished: (job: BulkJob) => void;
+}
+
+/** Global renderer store. Kept intentionally small — grow it as needed. */
+export const useAppStore = create<AppState>((set, get) => ({
+  appInfo: null,
+  mcpInfo: null,
+  loadAppInfo: async () => {
+    const appInfo = await window.api.getAppInfo();
+    set({ appInfo });
+  },
+  loadMcpInfo: async () => {
+    const mcpInfo = await window.api.getMcpInfo();
+    set({ mcpInfo });
+  },
+
+  portfolio: [],
+  portfolioErrors: [],
+  portfolioRegistrars: [],
+  portfolioRegistrarLabels: {},
+  portfolioLoading: false,
+  portfolioError: null,
+  portfolioLoadedAt: null,
+  portfolioSource: null,
+  refreshTick: 0,
+  registrars: null,
+
+  loadRegistrars: async () => {
+    set({ registrars: await window.api.getRegistrarMetadata() });
+  },
+
+  syncRegistrar: async (name, accountId) => {
+    const prefix = `${accountId ?? name}:`;
+    set((state) => ({
+      enriched: Object.fromEntries(
+        Object.entries(state.enriched).filter(
+          ([key]) => !key.startsWith(prefix),
+        ),
+      ),
+    }));
+    const result = await withSyncTimeout(
+      window.api.syncRegistrar(name, accountId),
+    );
+    // Merge the updated aggregate into the portfolio without disturbing other
+    // registrars' lazily-loaded detail/pricing (those maps stay keyed by
+    // registrar:domain and remain valid). A full "Sync domains" is what clears
+    // them.
+    set((state) => ({
+      portfolio: result.domains,
+      portfolioErrors: result.errors,
+      portfolioRegistrars: result.registrars,
+      portfolioRegistrarLabels: result.registrarLabels,
+      portfolioLoadedAt: result.fetchedAt ?? Date.now(),
+      portfolioSource: state.portfolioSource ?? 'live',
+    }));
+    // Refresh sync statuses (this registrar's lastSyncedAt/lastError) for the
+    // Settings cards and the status-bar pill, and the pricing map so this
+    // registrar's just-synced renewal prices show (local, no network).
+    await get().loadRegistrars();
+    await get().loadPricing();
+    await get().loadDomainEvents();
+    await get().loadFolders();
+    const meta = get().registrars?.find(
+      (r) => r.name === name && (!accountId || r.accountId === accountId),
+    );
+    return (
+      meta?.sync ?? {
+        lastSyncedAt: null,
+        lastError: null,
+        lastErrorAt: null,
+        domainCount: 0,
+        trackedSince: null,
+      }
+    );
+  },
+
+  setRegistrarEnabled: async (name, enabled, accountId) => {
+    // Main flips the flag, then either re-syncs (enable) or hides the account's
+    // cached data (disable), and returns the reassembled portfolio.
+    const result = await withSyncTimeout(
+      window.api.setRegistrarEnabled(name, enabled, accountId),
+    );
+    set((state) => ({
+      portfolio: result.domains,
+      portfolioErrors: result.errors,
+      portfolioRegistrars: result.registrars,
+      portfolioRegistrarLabels: result.registrarLabels,
+      portfolioLoadedAt:
+        result.fetchedAt ?? state.portfolioLoadedAt ?? Date.now(),
+      portfolioSource: state.portfolioSource ?? 'live',
+    }));
+    // Reflect the enabled flag + any new sync status in the Settings cards and
+    // status bar, and re-read pricing for the updated portfolio.
+    await get().loadRegistrars();
+    await get().loadPricing();
+    await get().loadDomainEvents();
+    await get().loadFolders();
+  },
+
+  hydrateFromCache: async () => {
+    // Only hydrate before any live load — never clobber fresher data.
+    if (get().portfolioSource !== null || get().portfolioLoading) return;
+    const snapshot = await window.api.hydrateFromCache();
+    if (!snapshot.portfolio) {
+      // No registrar data, but imported names still have prices.
+      if (get().portfolioSource === null) set({ pricing: snapshot.pricing });
+      return;
+    }
+    // Don't overwrite a live load that landed while this was awaiting.
+    if (get().portfolioSource !== null) return;
+
+    const { portfolio, detail, pricing } = snapshot;
+    // Merge cached detail over its summary domain, matching enrichVisible's shape.
+    const enriched: Record<string, Domain> = {};
+    for (const d of portfolio.domains) {
+      const key = domainKey(d);
+      if (detail[key]) enriched[key] = { ...d, ...detail[key] };
+    }
+
+    set({
+      portfolio: portfolio.domains,
+      portfolioErrors: portfolio.errors,
+      portfolioRegistrars: portfolio.registrars,
+      portfolioRegistrarLabels: portfolio.registrarLabels,
+      portfolioLoadedAt: portfolio.fetchedAt,
+      portfolioSource: 'cache',
+      enriched,
+      pricing,
+    });
+  },
+
+  applyPortfolioCacheUpdate: async () => {
+    // DomBot's own data isn't cache: an MCP tool can change history, folders,
+    // notes, prices, imported names (read with the events) or an account's
+    // enabled state before the portfolio has ever loaded, so re-read it all
+    // unconditionally. Each is a local read, no network.
+    const local = Promise.all([
+      get().loadDomainEvents(),
+      get().loadFolders(),
+      get().loadPurchases(),
+      get().loadListPrices(),
+      get().loadPricing(),
+      get().loadRegistrars(),
+    ]).then(() => undefined);
+    // Before the first load there's nothing in view to overlay; the launch
+    // hydrate path covers a fresh start.
+    if (get().portfolioSource === null) return local;
+    const snapshot = await window.api.hydrateFromCache();
+    const portfolio = snapshot.portfolio;
+    if (!portfolio) {
+      set({
+        portfolio: [],
+        portfolioErrors: [],
+        portfolioRegistrars: [],
+        enriched: {},
+        // Imported names keep their prices without registrar data.
+        pricing: snapshot.pricing,
+      });
+      return local;
+    }
+    set((state) => {
+      // Overlay the freshly-cached summary + detail onto any existing enriched
+      // entry so a patched field (auto-renew, lock, privacy, nameservers, …)
+      // wins while previously-fetched detail is preserved.
+      const enriched = { ...state.enriched };
+      for (const d of portfolio.domains) {
+        const key = domainKey(d);
+        const detail = snapshot.detail[key];
+        const existing = enriched[key];
+        if (existing || detail) {
+          enriched[key] = { ...(existing ?? {}), ...d, ...(detail ?? {}) };
+        }
+      }
+      return {
+        portfolio: portfolio.domains,
+        portfolioErrors: portfolio.errors,
+        portfolioRegistrars: portfolio.registrars,
+        portfolioRegistrarLabels: portfolio.registrarLabels,
+        portfolioLoadedAt: portfolio.fetchedAt,
+        enriched,
+      };
+    });
+    await local;
+  },
+
+  clearAllCaches: async () => {
+    await window.api.clearAllCaches();
+    enrichInFlight.clear();
+    enrichFailed.clear();
+    detailAllInFlight = false;
+    set({
+      portfolio: [],
+      portfolioErrors: [],
+      portfolioRegistrars: [],
+      portfolioRegistrarLabels: {},
+      portfolioLoadedAt: null,
+      portfolioSource: null,
+      portfolioError: null,
+      enriched: {},
+      enriching: {},
+      pricing: {},
+      detailAllLoading: false,
+      selected: new Set(),
+    });
+    // Imported names aren't cache: re-read their prices.
+    await get().loadPricing();
+  },
+
+  loadPortfolio: async () => {
+    set({ portfolioLoading: true, portfolioError: null });
+    try {
+      const result = await withSyncTimeout(window.api.listPortfolio(true));
+      // Fresh summary data invalidates any prior per-domain detail.
+      enrichInFlight.clear();
+      enrichFailed.clear();
+      detailAllInFlight = false;
+      const keys = new Set(result.domains.map(domainKey));
+      set((state) => ({
+        portfolio: result.domains,
+        portfolioErrors: result.errors,
+        portfolioRegistrars: result.registrars,
+        portfolioRegistrarLabels: result.registrarLabels,
+        portfolioLoading: false,
+        portfolioLoadedAt: result.fetchedAt ?? Date.now(),
+        portfolioSource: 'live',
+        refreshTick: state.refreshTick + 1,
+        enriched: {},
+        enriching: {},
+        pricing: {},
+        detailAllLoading: false,
+        selected: new Set([...state.selected].filter((k) => keys.has(k))),
+      }));
+      // Per-registrar sync statuses changed — refresh the shared metadata, and
+      // re-read the pricing map: the sync just refreshed renewal quotes and the
+      // prices are computed locally in main (no network).
+      void get().loadRegistrars();
+      void get().loadPricing();
+      void get().loadDomainEvents();
+      void get().loadFolders();
+    } catch (err) {
+      set({
+        portfolioLoading: false,
+        portfolioError: err instanceof Error ? err.message : String(err),
+      });
+    }
+  },
+
+  enriched: {},
+  enriching: {},
+  mutating: {},
+  applyDomainOp: async (target, op, optimistic) => {
+    const key = domainKey(target);
+    const state = get();
+    // Base to merge onto: the already-enriched full domain if present, else the
+    // portfolio summary. Absent (a domain not in view) → no row to update, but
+    // the op still runs.
+    const base =
+      state.enriched[key] ?? state.portfolio.find((d) => domainKey(d) === key);
+    const overlay = (patch: Partial<Domain>) =>
+      set((s) => {
+        const current = s.enriched[key] ?? base;
+        if (!current) return {};
+        return { enriched: { ...s.enriched, [key]: { ...current, ...patch } } };
+      });
+    const rollback = () => {
+      if (base) set((s) => ({ enriched: { ...s.enriched, [key]: base } }));
+    };
+
+    if (optimistic) overlay(optimistic);
+    set((s) => ({ mutating: { ...s.mutating, [key]: true } }));
+    try {
+      const result = await window.api.applyDomainOp(target, op);
+      if (result.status === 'ok') {
+        if (result.patch) overlay(result.patch);
+      } else if (optimistic) {
+        rollback();
+      }
+      return result;
+    } catch (err) {
+      if (optimistic) rollback();
+      return {
+        target,
+        status: 'failed',
+        message: err instanceof Error ? err.message : String(err),
+      };
+    } finally {
+      set((s) => {
+        const mutating = { ...s.mutating };
+        delete mutating[key];
+        return { mutating };
+      });
+    }
+  },
+  enrichVisible: async (domains, force = false) => {
+    const todo = domains.filter((d) => {
+      const key = domainKey(d);
+      // A name that already left the registrar, or one you added by hand, has
+      // no registrar to ask.
+      if (d.departed || d.source === 'imported') return false;
+      // Nor does a row without a name (core drops these; belt and braces).
+      if (!d.domainName) return false;
+      // A forced refresh re-fetches on-screen rows regardless of prior state,
+      // skipping only ones already in flight.
+      if (force) return !enrichInFlight.has(key);
+      return (
+        // Only enrich rows the list didn't fully populate. Registrars that
+        // return nameservers in the list also report privacy/lock correctly, so
+        // a row that already has nameservers needs no detail lookup.
+        d.nameservers.length === 0 &&
+        !get().enriched[key] &&
+        !enrichInFlight.has(key) &&
+        !enrichFailed.has(key)
+      );
+    });
+    if (todo.length === 0) return;
+
+    // Mark all pending rows as loading up front so their detail cells show a
+    // placeholder immediately, before the concurrency-limited fetches start.
+    todo.forEach((d) => enrichInFlight.add(domainKey(d)));
+    set((state) => {
+      const enriching = { ...state.enriching };
+      for (const d of todo) enriching[domainKey(d)] = true;
+      return { enriching };
+    });
+
+    const clearEnriching = (key: string) =>
+      set((state) => {
+        const enriching = { ...state.enriching };
+        delete enriching[key];
+        return { enriching };
+      });
+
+    const CONCURRENCY = 6;
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      while (next < todo.length) {
+        const d = todo[next++];
+        const key = domainKey(d);
+        try {
+          const detail = await window.api.getDomainDetail(
+            d.registrar as RegistrarName,
+            d.domainName,
+            force,
+            d.accountId,
+          );
+          if (detail) {
+            // detail is a partial — merge it over the list summary.
+            set((state) => ({
+              enriched: { ...state.enriched, [key]: { ...d, ...detail } },
+            }));
+          } else {
+            // No detail available (unsupported TLD etc.) — keep the summary and
+            // don't retry this domain.
+            enrichFailed.add(key);
+          }
+        } catch {
+          // Hard failure — keep summary values and don't retry.
+          enrichFailed.add(key);
+        } finally {
+          enrichInFlight.delete(key);
+          clearEnriching(key);
+        }
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(CONCURRENCY, todo.length) }, worker),
+    );
+  },
+
+  detailAllLoading: false,
+  loadAllDetail: async (domains) => {
+    if (detailAllInFlight) return;
+    detailAllInFlight = true;
+    set({ detailAllLoading: true });
+    try {
+      // enrichVisible fetches only rows still missing detail and dedupes the
+      // rest, so passing the whole portfolio loads everything not yet cached.
+      await get().enrichVisible(domains);
+    } finally {
+      detailAllInFlight = false;
+      set({ detailAllLoading: false });
+    }
+  },
+
+  pricing: {},
+  loadPricing: async () => {
+    const pricing = await window.api.getPortfolioPricing();
+    set({ pricing });
+  },
+  setManualPrice: async (domain, price) => {
+    await window.api.setManualPrice(domain, price);
+    // The override changes one domain's price; re-read the whole map (local, no
+    // network) so the dashboard totals and the row both reflect it.
+    await get().loadPricing();
+  },
+
+  folders: [],
+  folderAssignments: {},
+  loadFolders: async () => {
+    const { folders, assignments } = await window.api.getFolders();
+    set({ folders, folderAssignments: assignments });
+  },
+  createFolder: async (input) => {
+    const folder = await window.api.createFolder(input);
+    set((state) => ({ folders: [...state.folders, folder] }));
+    return folder;
+  },
+  updateFolder: async (id, patch) => {
+    await window.api.updateFolder(id, patch);
+    set((state) => ({
+      folders: state.folders.map((f) => (f.id === id ? { ...f, ...patch } : f)),
+    }));
+  },
+  deleteFolder: async (id) => {
+    await window.api.deleteFolder(id);
+    set((state) => {
+      // Mirror the service: drop the folder and any assignments pointing at it.
+      const folderAssignments: Record<string, string> = {};
+      for (const [key, folderId] of Object.entries(state.folderAssignments)) {
+        if (folderId !== id) folderAssignments[key] = folderId;
+      }
+      return {
+        folders: state.folders.filter((f) => f.id !== id),
+        folderAssignments,
+      };
+    });
+  },
+  assignFolder: async (domainName, folderId) => {
+    await window.api.assignFolder(domainName, folderId);
+    const key = toAscii(domainName);
+    set((state) => {
+      const folderAssignments = { ...state.folderAssignments };
+      if (folderId === null) delete folderAssignments[key];
+      else folderAssignments[key] = folderId;
+      return { folderAssignments };
+    });
+  },
+
+  settings: null,
+  loadSettings: async () => {
+    set({ settings: await window.api.getSettings() });
+  },
+  setAutoSyncInterval: async (minutes) => {
+    const settings = await window.api.updateSettings({
+      autoSyncIntervalMinutes: minutes,
+    });
+    set({ settings });
+  },
+  saveMoneySettings: async (patch) => {
+    const settings = await window.api.updateSettings(patch);
+    set({ settings });
+  },
+  purchases: {},
+  loadPurchases: async () => {
+    set({ purchases: await window.api.getPurchases() });
+  },
+  savePurchase: async (input) => {
+    const saved = await window.api.setPurchase(input);
+    void get().loadDomainEvents();
+    const key = toAscii(input.domainName);
+    set((state) => {
+      const purchases = { ...state.purchases };
+      if (saved) purchases[key] = saved;
+      else delete purchases[key];
+      return { purchases };
+    });
+  },
+  saveNotes: async (domainName, notes) => {
+    const saved = await window.api.setNotes(domainName, notes);
+    const key = toAscii(domainName);
+    set((state) => {
+      const purchases = { ...state.purchases };
+      if (saved) purchases[key] = saved;
+      else delete purchases[key];
+      return { purchases };
+    });
+  },
+  saveSale: async (input) => {
+    const saved = await window.api.setSale(input);
+    void get().loadDomainEvents();
+    const key = toAscii(input.domainName);
+    set((state) => {
+      const purchases = { ...state.purchases };
+      if (saved) purchases[key] = saved;
+      else delete purchases[key];
+      return { purchases };
+    });
+  },
+  importedDomains: {},
+  loadImportedDomains: async () => {
+    set({ importedDomains: await window.api.getImportedDomains() });
+  },
+  saveImportedDomain: async (domainName, fields) => {
+    set({
+      importedDomains: await window.api.updateImportedDomain(
+        domainName,
+        fields,
+      ),
+    });
+    void get().loadPricing();
+  },
+  listPrices: {},
+  loadListPrices: async () => {
+    set({ listPrices: await window.api.getListPrices() });
+  },
+  saveListPrices: async (inputs) => {
+    set({ listPrices: await window.api.setListPrices(inputs) });
+  },
+  registrationLookups: {},
+  loadRegistrationLookups: async (domainNames) => {
+    if (domainNames.length === 0) return;
+    const found = await window.api
+      .lookupRegistrations(domainNames)
+      .catch(() => ({}) as Record<string, RegistrationLookup>);
+    set((state) => {
+      const next = { ...state.registrationLookups, ...found };
+      // A name left out couldn't be looked up, so Archive stops waiting on it.
+      // An earlier answer for it stands.
+      for (const name of domainNames) {
+        const key = toAscii(name);
+        if (next[key] === undefined) next[key] = null;
+      }
+      return { registrationLookups: next };
+    });
+  },
+  domainEvents: [],
+  loadDomainEvents: async () => {
+    // A sync that writes events may also have taken imported names over.
+    const [domainEvents, importedDomains] = await Promise.all([
+      window.api.getDomainEvents(),
+      window.api.getImportedDomains(),
+    ]);
+    set({ domainEvents, importedDomains });
+  },
+  setDispositions: async (items, type, date) => {
+    set({
+      domainEvents: await window.api.setDispositions(items, type, date),
+    });
+  },
+  markSold: async (items, date) => {
+    set({ domainEvents: await window.api.markSold(items, date) });
+    await get().loadPurchases();
+  },
+  restoreOwned: async (domainNames) => {
+    set({ domainEvents: await window.api.restoreOwned(domainNames) });
+    await get().loadPurchases();
+  },
+  setAlertsDismissed: async (ids, dismissed) => {
+    set({ domainEvents: await window.api.setAlertsDismissed(ids, dismissed) });
+  },
+  deleteUserEvent: async (id) => {
+    set({ domainEvents: await window.api.deleteUserEvent(id) });
+    await get().loadPurchases();
+  },
+  deleteDomains: async (domainNames) => {
+    set({ domainEvents: await window.api.deleteDomains(domainNames) });
+    await Promise.all([
+      get().loadPurchases(),
+      get().loadFolders(),
+      get().loadPricing(),
+      get().loadListPrices(),
+      get().loadImportedDomains(),
+    ]);
+  },
+  setUpdateChecks: async (enabled) => {
+    const settings = await window.api.updateSettings({
+      updateChecks: enabled,
+    });
+    set({ settings });
+  },
+  setMcpEnabled: async (enabled) => {
+    const settings = await window.api.updateSettings({ mcpEnabled: enabled });
+    // The server starts/stops asynchronously in main; re-read its status so
+    // the status bar and the MCP page reflect it.
+    const mcpInfo = await window.api.getMcpInfo();
+    set({ settings, mcpInfo });
+  },
+  selected: new Set(),
+  toggleSelected: (key) =>
+    set((state) => {
+      const selected = new Set(state.selected);
+      if (selected.has(key)) selected.delete(key);
+      else selected.add(key);
+      return { selected };
+    }),
+  setSelectedMany: (keys, on) =>
+    set((state) => {
+      const selected = new Set(state.selected);
+      for (const k of keys) {
+        if (on) selected.add(k);
+        else selected.delete(k);
+      }
+      return { selected };
+    }),
+  clearSelection: () => set({ selected: new Set() }),
+
+  bulk: null,
+  startBulk: async (targets, op) => {
+    const job = await window.api.startBulk(targets, op);
+    set((state) => {
+      const mutating = { ...state.mutating };
+      for (const t of targets) mutating[domainKey(t)] = true;
+      return { bulk: job, mutating };
+    });
+    return job;
+  },
+  cancelBulk: async () => {
+    const job = get().bulk;
+    if (job && job.status === 'running') await window.api.cancelBulk(job.id);
+  },
+  attachBulk: async () => {
+    const job = await window.api.getBulkJob();
+    set((state) => {
+      // Rows a still-running job hasn't reached yet read as mutating.
+      if (!job || job.status !== 'running') return { bulk: job };
+      const mutating = { ...state.mutating };
+      const done = new Set(job.results.map((r) => domainKey(r.target)));
+      for (const d of state.portfolio) {
+        const key = domainKey(d);
+        if (!done.has(key)) mutating[key] = true;
+      }
+      return { bulk: job, mutating };
+    });
+  },
+  applyBulkProgress: ({ jobId, result }) =>
+    set((state) => {
+      const key = domainKey(result.target);
+      const mutating = { ...state.mutating };
+      delete mutating[key];
+      const next: Partial<AppState> = { mutating };
+      if (result.status === 'ok' && result.patch) {
+        const base =
+          state.enriched[key] ??
+          state.portfolio.find((d) => domainKey(d) === key);
+        if (base) {
+          next.enriched = {
+            ...state.enriched,
+            [key]: { ...base, ...result.patch },
+          };
+        }
+      }
+      if (state.bulk && state.bulk.id === jobId) {
+        const counts = { ...state.bulk.counts };
+        counts[result.status] += 1;
+        next.bulk = {
+          ...state.bulk,
+          results: [...state.bulk.results, result],
+          counts,
+        };
+      }
+      return next;
+    }),
+  applyBulkFinished: (job) =>
+    set((state) => {
+      // Anything still marked from this job (cancelled before it ran) clears.
+      const mutating = { ...state.mutating };
+      for (const r of job.results) {
+        delete mutating[domainKey(r.target)];
+      }
+      return { bulk: job, mutating };
+    }),
+  rememberNameservers: async (nameservers) => {
+    const key = (set: string[]) => [...set].sort().join('\n');
+    const current = get().settings?.recentNameservers ?? [];
+    const recentNameservers = [
+      nameservers,
+      ...current.filter((s) => key(s) !== key(nameservers)),
+    ].slice(0, 3);
+    const settings = await window.api.updateSettings({ recentNameservers });
+    set({ settings });
+  },
+}));

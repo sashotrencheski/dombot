@@ -1,0 +1,775 @@
+import { accountTitle } from '../../shared/account-label';
+import { multiAccountRegistrars } from '../lib/registrar-accounts';
+import { domainKey } from '../../shared/account-key';
+import { useMemo, useState } from 'react';
+import {
+  CalendarClock,
+  CircleDollarSign,
+  Globe,
+  type LucideIcon,
+} from 'lucide-react';
+import type { Domain } from '../../shared/ipc';
+import { importedRows } from '../../shared/imported-domains';
+import { useAppStore } from '../store/app';
+import {
+  dueWithin,
+  groupBy,
+  mainCurrency,
+  priceOf,
+  summarize,
+  tldOf,
+  upcomingByMonth,
+  wholeMoney,
+  type CurrencyTotal,
+  type Group,
+  type MonthBucket,
+} from '../lib/renewals';
+import { cn } from '@/lib/utils';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Badge } from '@/components/ui/badge';
+import {
+  Empty,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyTitle,
+} from '@/components/ui/empty';
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table';
+
+type RegistrarLabels = Record<string, string>;
+
+function registrarLabel(id: string, labels: RegistrarLabels): string {
+  return labels[id] ?? id;
+}
+
+/** Grouped count, e.g. "1,050". */
+function count(n: number): string {
+  return n.toLocaleString('en-US');
+}
+
+// ── Donut slices ─────────────────────────────────────────────────────────────
+
+interface Slice {
+  label: string;
+  value: number;
+  color: string;
+}
+
+// Categorical palette — a full spread of hues around the wheel at a shared,
+// slightly muted depth so no single slice reads brighter than the rest. Ordered
+// most-common-first with adjacent slices set to contrast; royal blue anchors
+// the largest slice. The dark brand green is kept out of the charts (it read as
+// a heavy anchor) in favor of a brighter grass green. Plus a neutral gray
+// "Other" for the folded tail.
+const DONUT_PALETTE = [
+  '#35509e', // royal blue
+  '#b39a3c', // ochre gold
+  '#3f9e57', // green
+  '#b0603a', // terracotta
+  '#2e8f96', // teal
+  '#b0505f', // dusty rose
+  '#6b5b9a', // muted violet
+  '#5a7a92', // slate blue
+];
+const OTHER_COLOR = '#8a8f88';
+
+/** Rank groups by `value`, keep the top N as their own slices, and fold the
+ * long tail into a single "Other" slice so the donut stays legible. */
+function toSlices(
+  groups: Group[],
+  value: (g: Group) => number,
+  topN = 8,
+): Slice[] {
+  const ranked = groups
+    .filter((g) => value(g) > 0)
+    .sort((a, b) => value(b) - value(a));
+  const slices: Slice[] = ranked.slice(0, topN).map((g, i) => ({
+    label: g.label,
+    value: value(g),
+    color: DONUT_PALETTE[i % DONUT_PALETTE.length],
+  }));
+  const rest = ranked.slice(topN);
+  const restTotal = rest.reduce((sum, g) => sum + value(g), 0);
+  if (restTotal > 0) {
+    slices.push({
+      label: `Other (${rest.length})`,
+      value: restTotal,
+      color: OTHER_COLOR,
+    });
+  }
+  return slices;
+}
+
+// The "Set prices manually" editor is hidden for now; the state and handlers
+// stay wired up so it can be switched back on later.
+const MANUAL_PRICING_ENABLED = false;
+
+// ── Page ─────────────────────────────────────────────────────────────────────
+
+export default function Renewals() {
+  const {
+    portfolio: syncedDomains,
+    importedDomains,
+    portfolioLoadedAt,
+    portfolioRegistrarLabels,
+    pricing,
+    setManualPrice,
+  } = useAppStore();
+
+  // Synced names plus the ones you added by hand.
+  const allDomains = useMemo(
+    () => [...syncedDomains, ...importedRows(importedDomains, syncedDomains)],
+    [syncedDomains, importedDomains],
+  );
+  const [account, setAccount] = useState('all');
+  const accounts = useAppStore((s) => s.registrars);
+  const multipleAccounts = useMemo(
+    () => multiAccountRegistrars(accounts, allDomains),
+    [accounts, allDomains],
+  );
+  const showAccountDetails = multipleAccounts.size > 0;
+  const portfolio = useMemo(
+    () =>
+      !showAccountDetails || account === 'all'
+        ? allDomains
+        : allDomains.filter((d) => (d.accountId ?? d.registrar) === account),
+    [allDomains, account, showAccountDetails],
+  );
+  const accountFilter = showAccountDetails && (
+    <label className="flex items-center gap-3 text-sm">
+      Account
+      <select
+        aria-label="Account"
+        className="rounded-md border bg-background px-3 py-2"
+        value={account}
+        onChange={(e) => setAccount(e.target.value)}
+      >
+        <option value="all">All accounts</option>
+        {accounts
+          ?.filter((r) => r.configured && r.enabled)
+          .map((r) => (
+            <option key={r.accountId ?? r.name} value={r.accountId ?? r.name}>
+              {accountTitle(
+                r.displayName,
+                r.accountLabel,
+                multipleAccounts.has(r.name),
+              )}
+            </option>
+          ))}
+      </select>
+    </label>
+  );
+  const hasPortfolio =
+    portfolio.length > 0 &&
+    (portfolioLoadedAt !== null ||
+      portfolio.some((d) => d.source === 'imported'));
+  const hasPricing = Object.keys(pricing).length > 0;
+  // Pricing is computed locally in main and arrives with the portfolio (and is
+  // re-read after each Sync), so "loading" is just the brief gap before it lands.
+  const pricingLoading = hasPortfolio && !hasPricing;
+
+  // Prices keep their own currency and are never converted: the totals are in
+  // the currency most names renew in, and any others are listed beside them.
+  const currency = useMemo(
+    () => mainCurrency(portfolio, pricing),
+    [portfolio, pricing],
+  );
+  const usd = (n: number) => wholeMoney(n, currency);
+  const summary = useMemo(
+    () => summarize(portfolio, pricing, currency),
+    [portfolio, pricing, currency],
+  );
+  const othersNote = plusOthers(summary.others);
+  const byRegistrar = useMemo(
+    () =>
+      groupBy(
+        portfolio,
+        pricing,
+        (d) => d.registrar,
+        (id) => registrarLabel(id, portfolioRegistrarLabels),
+        currency,
+      ),
+    [portfolio, pricing, portfolioRegistrarLabels, currency],
+  );
+  const byTld = useMemo(
+    () =>
+      groupBy(
+        portfolio,
+        pricing,
+        (d) => tldOf(d.domainName),
+        (t) => (t ? `.${t}` : '—'),
+        currency,
+      ),
+    [portfolio, pricing, currency],
+  );
+  const months = useMemo(
+    () => upcomingByMonth(portfolio, pricing, 12, currency),
+    [portfolio, pricing, currency],
+  );
+  const due90 = useMemo(
+    () => dueWithin(portfolio, pricing, 90, currency),
+    [portfolio, pricing, currency],
+  );
+
+  // Donut slices: registrar and TLD, each by domain count and by yearly spend.
+  const regCount = useMemo(
+    () => toSlices(byRegistrar, (g) => g.count),
+    [byRegistrar],
+  );
+  const regSpend = useMemo(
+    () => toSlices(byRegistrar, (g) => g.yearly),
+    [byRegistrar],
+  );
+  const tldCount = useMemo(() => toSlices(byTld, (g) => g.count), [byTld]);
+  const tldSpend = useMemo(() => toSlices(byTld, (g) => g.yearly), [byTld]);
+  const regSpendTotal = regSpend.reduce((s, x) => s + x.value, 0);
+  const tldSpendTotal = tldSpend.reduce((s, x) => s + x.value, 0);
+
+  // Domains that can't be priced automatically or already carry a manual price —
+  // the working set for the inline editor.
+  const needsPrice = useMemo(
+    () =>
+      portfolio.filter((d) => {
+        const p = priceOf(d, pricing);
+        return p?.source === 'unavailable' || p?.source === 'manual';
+      }),
+    [portfolio, pricing],
+  );
+
+  if (!hasPortfolio) {
+    return (
+      <div className="mx-auto max-w-[1400px]">
+        <PageHeader loading={pricingLoading} summary={summary} />
+        {accountFilter}
+        <Empty className="mt-6 rounded-lg border border-dashed">
+          <EmptyHeader>
+            <EmptyTitle>No portfolio loaded</EmptyTitle>
+            <EmptyDescription>
+              Load your domains on the Domains tab first — the renewals
+              dashboard is built from that portfolio.
+            </EmptyDescription>
+          </EmptyHeader>
+        </Empty>
+      </div>
+    );
+  }
+
+  const monthly = summary.yearly / 12;
+
+  return (
+    <div className="mx-auto flex max-w-[1400px] flex-col gap-6">
+      <PageHeader loading={pricingLoading} summary={summary} />
+      {accountFilter}
+
+      {/* Totals */}
+      <div className="grid gap-4 sm:grid-cols-3">
+        <StatCard
+          icon={Globe}
+          accentClass="text-blue-500"
+          label="Total domains"
+          value={count(summary.total)}
+          hint={`${byRegistrar.length} registrar${
+            byRegistrar.length === 1 ? '' : 's'
+          } · ${byTld.length} TLD${byTld.length === 1 ? '' : 's'}`}
+        />
+        <StatCard
+          icon={CircleDollarSign}
+          accentClass="text-brand-500"
+          label="Yearly renewals"
+          value={usd(summary.yearly)}
+          hint={`${usd(monthly)}/mo · ${usd(summary.yearlyAutoRenew)} auto-renews, ${usd(
+            summary.yearly - summary.yearlyAutoRenew,
+          )} manual${othersNote ? ` · ${othersNote}` : ''}`}
+        />
+        <StatCard
+          icon={CalendarClock}
+          accentClass="text-amber-500"
+          label="Due next 90 days"
+          value={usd(due90.yearly)}
+          hint={`${due90.count} domain${due90.count === 1 ? '' : 's'} renewing${
+            due90.others.length ? ` · ${plusOthers(due90.others)}` : ''
+          }`}
+        />
+      </div>
+
+      {/* Spend over time — sits between the totals and the composition donuts so
+          the two rows of three never read as paired. */}
+      <MonthlyBarChart months={months} fmt={usd} />
+
+      {/* Composition: two pairs (count + spend), one row per dimension. */}
+      <div className="grid gap-4 md:grid-cols-2">
+        <DonutCard
+          title="Domains by registrar"
+          slices={regCount}
+          centerValue={count(summary.total)}
+          centerLabel="domains"
+          fmt={count}
+        />
+        <DonutCard
+          title="Spend by registrar"
+          slices={regSpend}
+          centerValue={usd(regSpendTotal)}
+          centerLabel="per year"
+          fmt={usd}
+        />
+        <DonutCard
+          title="Domains by TLD"
+          slices={tldCount}
+          centerValue={count(summary.total)}
+          centerLabel="domains"
+          fmt={count}
+        />
+        <DonutCard
+          title="Spend by TLD"
+          slices={tldSpend}
+          centerValue={usd(tldSpendTotal)}
+          centerLabel="per year"
+          fmt={usd}
+        />
+      </div>
+
+      {/* Manual price editor */}
+      {MANUAL_PRICING_ENABLED && needsPrice.length > 0 && (
+        <PriceEditor
+          domains={needsPrice}
+          labels={portfolioRegistrarLabels}
+          pricing={pricing}
+          onSave={setManualPrice}
+        />
+      )}
+    </div>
+  );
+}
+
+// ── Header ───────────────────────────────────────────────────────────────────
+
+function PageHeader({
+  loading,
+  summary,
+}: {
+  loading: boolean;
+  summary: ReturnType<typeof summarize>;
+}) {
+  return (
+    <div className="flex items-end justify-between gap-4">
+      <div>
+        <h1 className="text-2xl font-bold sm:text-[32px]">Renewals</h1>
+        <p className="-mt-0.5 text-sm text-muted-foreground">
+          {loading
+            ? `Pricing… ${summary.priced}/${summary.total}`
+            : summary.priced > 0
+              ? `Forward-looking renewal costs · ${summary.priced}/${summary.total} priced`
+              : 'Annual renewal costs across your whole portfolio.'}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// ── Stat card ────────────────────────────────────────────────────────────────
+
+function StatCard({
+  icon: Icon,
+  accentClass,
+  label,
+  value,
+  hint,
+}: {
+  icon: LucideIcon;
+  /** Tailwind text-color for the background watermark (rendered at a low group
+   * opacity), e.g. "text-brand-500". */
+  accentClass: string;
+  label: string;
+  value: string;
+  hint: string;
+}) {
+  return (
+    <div className="relative overflow-hidden rounded-lg border bg-card px-4 pt-[9px] pb-[11px]">
+      <Icon
+        className={cn(
+          // Fade the whole shape as a group (opacity-[0.15]) rather than using a
+          // translucent stroke color — a semi-transparent stroke composites to
+          // bright spots wherever the icon's paths overlap.
+          'pointer-events-none absolute -right-4 -bottom-6 size-[123px] opacity-[0.15]',
+          accentClass,
+        )}
+        strokeWidth={1.5}
+        aria-hidden
+      />
+      <div className="relative">
+        <div className="text-[15px] text-foreground/75">{label}</div>
+        <div className="mt-2 text-2xl font-bold tabular-nums">{value}</div>
+        <div className="mt-1 text-xs text-muted-foreground">{hint}</div>
+      </div>
+    </div>
+  );
+}
+
+// ── Monthly bar chart ────────────────────────────────────────────────────────
+
+/** Totals in other currencies, e.g. "+ €45 · + £12". */
+function plusOthers(others: CurrencyTotal[]): string {
+  return others.map((o) => `+ ${wholeMoney(o.yearly, o.currency)}`).join(' · ');
+}
+
+// The bars are all a single flat blue — the month labels already tell them
+// apart, so per-bar hues just added noise.
+const BAR_COLOR = '#35509e';
+
+function MonthlyBarChart({
+  months,
+  fmt: usd,
+}: {
+  months: MonthBucket[];
+  /** Whole amounts in the page's currency. */
+  fmt: (n: number) => string;
+}) {
+  const max = Math.max(1, ...months.map((m) => m.yearly));
+  const total = months.reduce((sum, m) => sum + m.yearly, 0);
+  return (
+    // @container: the month labels are sized to the card, not the viewport,
+    // since the card's width depends on the page's grid and padding.
+    <div className="@container flex flex-col gap-3 rounded-lg border bg-card p-4 pt-[14px]">
+      <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+        <h2 className="text-[15px] font-semibold text-foreground/75">
+          Renewals by month
+        </h2>
+        <span className="text-xs text-muted-foreground">
+          {usd(total)} over 12 months
+        </span>
+      </div>
+      <div className="flex items-end gap-1.5 pt-2">
+        {months.map((m) => {
+          const pct = (m.yearly / max) * 100;
+          return (
+            <div
+              key={m.key}
+              className="flex min-w-0 flex-1 flex-col items-center gap-1.5"
+            >
+              <div className="relative h-[154px] w-full">
+                {/* Faint full-height track so the chart keeps a readable grid
+                    even where a month is empty or very short. */}
+                <div
+                  className="absolute inset-x-0 inset-y-0 rounded-t-[5px] rounded-b-[3px] bg-muted/30"
+                  aria-hidden
+                />
+                <div
+                  className="absolute inset-x-0 bottom-0 rounded-t-[5px] rounded-b-[3px] transition-[filter] hover:brightness-110"
+                  style={{
+                    height: `${pct}%`,
+                    backgroundColor: BAR_COLOR,
+                  }}
+                  title={`${m.label}: ${usd(m.yearly)}${
+                    m.others.length ? ` ${plusOthers(m.others)}` : ''
+                  } · ${m.count} domain${m.count === 1 ? '' : 's'}`}
+                />
+                {m.yearly > 0 && (
+                  <span
+                    // Hidden on phones, where 12 centered figures overlap; the
+                    // per-bar amount is still in the bar's hover title.
+                    className="absolute left-1/2 hidden -translate-x-1/2 -translate-y-1 text-[11px] whitespace-nowrap text-muted-foreground tabular-nums sm:block"
+                    style={{ bottom: `${pct}%` }}
+                  >
+                    {usd(m.yearly)}
+                  </span>
+                )}
+              </div>
+              {/* The full "Sep 2026" only once the card is wide enough for all
+                  twelve on one line (@3xl ≈ 768px). Narrower, just the month
+                  abbreviation: the full label is wider than a bar there, and
+                  letting it wrap broke unevenly ("May 2026" fit where
+                  "Sep 2026" didn't), so both are nowrap. */}
+              <span className="hidden text-xs whitespace-nowrap text-muted-foreground @3xl:block">
+                {m.label}
+              </span>
+              <span className="text-[10px] whitespace-nowrap text-muted-foreground sm:text-xs @3xl:hidden">
+                {m.label.slice(0, 3)}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ── Donut ────────────────────────────────────────────────────────────────────
+
+function Donut({
+  slices,
+  centerValue,
+  centerLabel,
+}: {
+  slices: Slice[];
+  centerValue: string;
+  centerLabel: string;
+}) {
+  const size = 132;
+  const stroke = 20;
+  const r = (size - stroke) / 2;
+  const c = size / 2;
+  const circumference = 2 * Math.PI * r;
+  const total = slices.reduce((sum, s) => sum + s.value, 0);
+  const gap = slices.length > 1 ? 1.5 : 0;
+  // Arc length of each slice and its cumulative start offset — computed purely
+  // (no running mutation) so the map below just reads them by index.
+  const lengths =
+    total > 0 ? slices.map((s) => (s.value / total) * circumference) : [];
+  const offsets = lengths.map((_, i) =>
+    lengths.slice(0, i).reduce((sum, l) => sum + l, 0),
+  );
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox={`0 0 ${size} ${size}`}
+      className="shrink-0"
+      role="img"
+      aria-label={`${centerValue} ${centerLabel}`}
+    >
+      {total === 0 ? (
+        <circle
+          cx={c}
+          cy={c}
+          r={r}
+          fill="none"
+          strokeWidth={stroke}
+          className="stroke-muted"
+        />
+      ) : (
+        <g transform={`rotate(-90 ${c} ${c})`}>
+          {slices.map((s, i) => {
+            const draw = Math.max(0, lengths[i] - gap);
+            return (
+              <circle
+                key={s.label}
+                cx={c}
+                cy={c}
+                r={r}
+                fill="none"
+                stroke={s.color}
+                strokeWidth={stroke}
+                strokeDasharray={`${draw} ${circumference - draw}`}
+                strokeDashoffset={-offsets[i]}
+              />
+            );
+          })}
+        </g>
+      )}
+      <text
+        x={c}
+        y={c - 5}
+        textAnchor="middle"
+        dominantBaseline="central"
+        className="fill-current text-sm font-bold text-foreground"
+      >
+        {centerValue}
+      </text>
+      <text
+        x={c}
+        y={c + 11}
+        textAnchor="middle"
+        dominantBaseline="central"
+        className="fill-current text-[10px] text-muted-foreground"
+      >
+        {centerLabel}
+      </text>
+    </svg>
+  );
+}
+
+function DonutCard({
+  title,
+  slices,
+  centerValue,
+  centerLabel,
+  fmt,
+}: {
+  title: string;
+  slices: Slice[];
+  centerValue: string;
+  centerLabel: string;
+  fmt: (n: number) => string;
+}) {
+  const total = slices.reduce((sum, s) => sum + s.value, 0);
+  return (
+    <div className="flex flex-col gap-3 rounded-lg border bg-card p-4 pt-[14px]">
+      <h2 className="text-[15px] font-semibold text-foreground/75">{title}</h2>
+      <div className="flex items-center gap-4">
+        <Donut
+          slices={slices}
+          centerValue={centerValue}
+          centerLabel={centerLabel}
+        />
+        <ul className="flex min-w-0 flex-1 flex-col gap-1.5 text-xs">
+          {slices.length === 0 && (
+            <li className="text-muted-foreground">No data yet</li>
+          )}
+          {slices.map((s) => (
+            <li key={s.label} className="flex items-center gap-2">
+              <span
+                className="size-2.5 shrink-0 rounded-full"
+                style={{ backgroundColor: s.color }}
+                aria-hidden
+              />
+              <span className="truncate">{s.label}</span>
+              <span className="ml-auto flex shrink-0 items-baseline gap-1 tabular-nums">
+                <span>{fmt(s.value)}</span>
+                {total > 0 && (
+                  <span className="text-muted-foreground/60">
+                    {Math.round((s.value / total) * 100)}%
+                  </span>
+                )}
+              </span>
+            </li>
+          ))}
+        </ul>
+      </div>
+    </div>
+  );
+}
+
+// ── Manual price editor ──────────────────────────────────────────────────────
+
+function PriceEditor({
+  domains,
+  labels,
+  pricing,
+  onSave,
+}: {
+  domains: Domain[];
+  labels: RegistrarLabels;
+  pricing: ReturnType<typeof useAppStore.getState>['pricing'];
+  onSave: (
+    domain: string,
+    price: { amount: string; currency: string } | null,
+  ) => Promise<void>;
+}) {
+  return (
+    <div className="flex flex-col gap-2">
+      <h2 className="text-[15px] font-semibold text-foreground/75">
+        Set prices manually{' '}
+        <span className="font-normal text-muted-foreground/70">
+          · registrars with no pricing API, or your own overrides
+        </span>
+      </h2>
+      <div className="overflow-x-auto rounded-lg border">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Domain</TableHead>
+              <TableHead>Registrar</TableHead>
+              <TableHead>Status</TableHead>
+              <TableHead className="w-[220px] text-right">
+                Annual price
+              </TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {domains.map((d) => {
+              const p = priceOf(d, pricing);
+              return (
+                <PriceEditorRow
+                  key={domainKey(d)}
+                  domain={d}
+                  label={registrarLabel(d.registrar, labels)}
+                  current={p?.source === 'manual' ? p.renewal : null}
+                  currency={p?.currency ?? 'USD'}
+                  isManual={p?.source === 'manual'}
+                  onSave={onSave}
+                />
+              );
+            })}
+          </TableBody>
+        </Table>
+      </div>
+    </div>
+  );
+}
+
+function PriceEditorRow({
+  domain,
+  label,
+  current,
+  currency,
+  isManual,
+  onSave,
+}: {
+  domain: Domain;
+  label: string;
+  current: number | null;
+  /** The price's currency (USD for a name with no price yet). */
+  currency: string;
+  isManual: boolean;
+  onSave: (
+    domain: string,
+    price: { amount: string; currency: string } | null,
+  ) => Promise<void>;
+}) {
+  const [value, setValue] = useState(current != null ? String(current) : '');
+  const [saving, setSaving] = useState(false);
+
+  const parsed = value.trim() === '' ? null : Number(value);
+  const invalid = parsed !== null && (Number.isNaN(parsed) || parsed < 0);
+  const dirty = value.trim() !== (current != null ? String(current) : '');
+
+  async function save() {
+    if (invalid) return;
+    setSaving(true);
+    try {
+      await onSave(
+        domain.domainName,
+        parsed === null ? null : { amount: String(parsed), currency },
+      );
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <TableRow>
+      <TableCell className="font-mono">{domain.domainName}</TableCell>
+      <TableCell>{label}</TableCell>
+      <TableCell>
+        {isManual ? (
+          <Badge variant="secondary">manual</Badge>
+        ) : (
+          <Badge variant="outline">no price</Badge>
+        )}
+      </TableCell>
+      <TableCell className="text-right">
+        <div className="flex items-center justify-end gap-2">
+          <Input
+            type="number"
+            inputMode="decimal"
+            min={0}
+            step="0.01"
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') void save();
+            }}
+            placeholder="—"
+            aria-invalid={invalid}
+            className="h-8 w-28 text-right tabular-nums"
+          />
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={saving || invalid || !dirty}
+            onClick={() => void save()}
+          >
+            {saving ? '…' : 'Save'}
+          </Button>
+        </div>
+      </TableCell>
+    </TableRow>
+  );
+}

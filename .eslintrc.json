@@ -1,0 +1,61 @@
+{
+  "root": true,
+  "env": {
+    "browser": true,
+    "es2022": true,
+    "node": true
+  },
+  "settings": {
+    "react": {
+      "version": "detect"
+    }
+  },
+  "extends": [
+    "eslint:recommended",
+    "plugin:@typescript-eslint/recommended",
+    "plugin:import/recommended",
+    "plugin:import/electron",
+    "plugin:import/typescript",
+    "plugin:react/recommended",
+    "plugin:react/jsx-runtime",
+    "plugin:react-hooks/recommended",
+    "prettier"
+  ],
+  "parser": "@typescript-eslint/parser",
+  "parserOptions": {
+    "ecmaVersion": "latest",
+    "sourceType": "module",
+    "ecmaFeatures": {
+      "jsx": true
+    }
+  },
+  "rules": {
+    "import/no-unresolved": "off",
+    "react-hooks/set-state-in-effect": "off"
+  },
+  "ignorePatterns": [".vite", "out", "dist", "node_modules", "temp"],
+  "overrides": [
+    {
+      "files": ["src/core/**/*.ts", "src/shared/**/*.ts"],
+      "rules": {
+        "no-restricted-imports": [
+          "error",
+          {
+            "paths": [
+              {
+                "name": "electron",
+                "message": "src/core is host-agnostic: no Electron. Put host code in src/electron."
+              }
+            ],
+            "patterns": [
+              {
+                "group": ["node:*"],
+                "message": "src/core must also run on Cloudflare Workers: no Node built-ins. Use web APIs (fetch, crypto, TextEncoder)."
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}
